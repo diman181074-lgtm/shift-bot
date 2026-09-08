@@ -1,0 +1,1 @@
+"""Shift handover bot application."""
