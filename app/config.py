@@ -11,5 +11,12 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    def __init__(self, **data):
+        super().__init__(**data)
+        if self.database_url.startswith("postgresql://"):
+            self.database_url = "postgresql+asyncpg://" + self.database_url[len("postgresql://"):]
+        elif self.database_url.startswith("postgres://"):
+            self.database_url = "postgresql+asyncpg://" + self.database_url[len("postgres://"):]
+
 
 settings = Settings()
