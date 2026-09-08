@@ -12,9 +12,7 @@ async def employee_by_telegram(
     conditions = [Employee.telegram_id == telegram_id]
     if username:
         conditions.append(Employee.telegram_username == username.lstrip("@"))
-    result = await session.execute(
-        select(Employee).where(or_(*conditions), Employee.is_active.is_(True))
-    )
+    result = await session.execute(select(Employee).where(or_(*conditions), Employee.is_active.is_(True)))
     employee = result.scalar_one_or_none()
     if employee and employee.telegram_id is None:
         employee.telegram_id = telegram_id
@@ -35,17 +33,21 @@ async def give_shift(session: AsyncSession, employee: Employee, shift: Shift) ->
 
 
 async def claim_shift(session: AsyncSession, employee: Employee, shift: Shift) -> SubstitutionRequest:
-    if shift.status != ShiftStatus.OFFERED:
+    result = await session.execute(select(Shift).where(Shift.id == shift.id).with_for_update())
+    locked_shift = result.scalar_one_or_none()
+    if locked_shift is None or locked_shift.status != ShiftStatus.OFFERED:
         raise ValueError("shift_unavailable")
+    if locked_shift.employee_id == employee.id:
+        raise ValueError("self_claim")
     request = SubstitutionRequest(
-        shift_id=shift.id,
-        old_employee_id=shift.employee_id,
+        shift_id=locked_shift.id,
+        old_employee_id=locked_shift.employee_id,
         new_employee_id=employee.id,
         status=RequestStatus.PENDING,
     )
-    shift.status = ShiftStatus.CLAIMED
+    locked_shift.status = ShiftStatus.CLAIMED
     session.add(request)
-    await audit(session, employee, "SHIFT_CLAIMED", "shift", shift.id)
+    await audit(session, employee, "SHIFT_CLAIMED", "shift", locked_shift.id)
     await session.commit()
     await session.refresh(request)
     return request
