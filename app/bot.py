@@ -1,14 +1,15 @@
 from datetime import datetime, timezone
 
 from aiogram import F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from sqlalchemy import select
 
 from app.db import SessionLocal
-from app.models import AuditLog, Employee, RequestStatus, Role, Shift, ShiftStatus, SubstitutionRequest
+from app.group_notifications import chat_id_for_venue, send_shift_offer
+from app.models import AuditLog, Employee, RequestStatus, Role, Shift, ShiftStatus, SubstitutionRequest, Venue
 from app.notifications import notify
 from app.services import claim_shift as claim_shift_service
 from app.services import create_shift, decide_request, employee_by_telegram, give_shift as give_shift_service, shift_label
@@ -72,15 +73,18 @@ async def get_employee(message: Message) -> Employee | None:
 
 async def notify_managers(bot, text: str) -> None:
     async with SessionLocal() as session:
-        result = await session.execute(
-            select(Employee).where(
-                Employee.role.in_([Role.MANAGER, Role.ADMIN]),
-                Employee.is_active.is_(True),
-            )
-        )
+        result = await session.execute(select(Employee).where(Employee.role.in_([Role.MANAGER, Role.ADMIN]), Employee.is_active.is_(True)))
         managers = result.scalars().all()
     for manager in managers:
         await notify(bot, manager, text)
+
+
+@router.message(Command("chatid"))
+async def chat_id_command(message: Message) -> None:
+    if message.chat.type not in ("group", "supergroup"):
+        await message.answer("Эту команду нужно отправить внутри рабочей Telegram-беседы.")
+        return
+    await message.answer(f"ID этой беседы: <code>{message.chat.id}</code>", parse_mode="HTML")
 
 
 @router.message(CommandStart())
@@ -112,10 +116,7 @@ async def my_shifts(message: Message) -> None:
             return
         result = await session.execute(select(Shift).where(Shift.employee_id == employee.id, Shift.date >= datetime.now(timezone.utc)).order_by(Shift.date))
         shifts = result.scalars().all()
-    await message.answer(
-        "Твои смены:\n\n" + ("\n".join(f"#{s.id} — {shift_label(s)}" for s in shifts) if shifts else "Смен нет."),
-        reply_markup=back_keyboard(),
-    )
+    await message.answer("Твои смены:\n\n" + ("\n".join(f"#{s.id} — {shift_label(s)}" for s in shifts) if shifts else "Смен нет."), reply_markup=back_keyboard())
 
 
 @router.message(F.text == "Отдать смену")
@@ -144,9 +145,21 @@ async def give_callback(callback: CallbackQuery) -> None:
         except ValueError:
             await callback.answer("Смену уже нельзя передать", show_alert=True)
             return
+        venue = await session.get(Venue, shift.venue_id)
         label = shift_label(shift)
-    await notify_managers(callback.bot, f"🔄 {employee.full_name} передаёт смену.\n{label}\nОна доступна для получения.")
-    await callback.message.edit_text(f"✅ Смена опубликована\n{label}")
+    if not venue:
+        await callback.answer("У смены не указана точка", show_alert=True)
+        return
+    chat_id = chat_id_for_venue(venue.name)
+    if not chat_id:
+        await callback.answer("Для этой точки ещё не настроена Telegram-беседа", show_alert=True)
+        return
+    try:
+        await send_shift_offer(callback.bot, chat_id, shift.id, venue.name, employee.full_name, label)
+    except Exception:
+        await callback.answer("Не удалось отправить смену в беседу. Проверьте, что бот добавлен в неё.", show_alert=True)
+        return
+    await callback.message.edit_text(f"✅ Смена опубликована в беседе «{venue.name}».\n{label}")
     await callback.answer()
 
 
@@ -189,10 +202,7 @@ async def my_requests(message: Message) -> None:
             return
         result = await session.execute(select(SubstitutionRequest).where(SubstitutionRequest.new_employee_id == employee.id).order_by(SubstitutionRequest.created_at.desc()).limit(20))
         requests = result.scalars().all()
-    await message.answer(
-        "Мои заявки:\n\n" + ("\n".join(f"#{r.id} — смена #{r.shift_id} — {r.status.value}" for r in requests) if requests else "Заявок нет."),
-        reply_markup=back_keyboard(),
-    )
+    await message.answer("Мои заявки:\n\n" + ("\n".join(f"#{r.id} — смена #{r.shift_id} — {r.status.value}" for r in requests) if requests else "Заявок нет."), reply_markup=back_keyboard())
 
 
 @router.message(F.text == "Заявки менеджера")
@@ -207,11 +217,7 @@ async def manager_requests(message: Message) -> None:
     if not requests:
         await message.answer("Новых заявок нет.", reply_markup=back_keyboard())
         return
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"Заявка #{r.id} · смена #{r.shift_id}", callback_data=f"request:{r.id}")] for r in requests
-        ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]]
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"Заявка #{r.id} · смена #{r.shift_id}", callback_data=f"request:{r.id}")] for r in requests] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]])
     await message.answer("Выбери заявку:", reply_markup=keyboard)
 
 
@@ -230,16 +236,8 @@ async def request_callback(callback: CallbackQuery) -> None:
         if request.status != RequestStatus.PENDING:
             await callback.answer("Заявка уже обработана", show_alert=True)
             return
-        text = (
-            f"📋 Заявка #{request.id}\n\n"
-            f"Смена: {shift_label(shift) if shift else '—'}\n"
-            f"Отдаёт: {old_employee.full_name if old_employee else '—'}\n"
-            f"Забирает: {new_employee.full_name if new_employee else '—'}"
-        )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"decision:approve:{request_id}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"decision:reject:{request_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="manager_requests")],
-    ])
+        text = f"📋 Заявка #{request.id}\n\nСмена: {shift_label(shift) if shift else '—'}\nОтдаёт: {old_employee.full_name if old_employee else '—'}\nЗабирает: {new_employee.full_name if new_employee else '—'}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"decision:approve:{request_id}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"decision:reject:{request_id}")], [InlineKeyboardButton(text="⬅️ Назад", callback_data="manager_requests")]])
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
@@ -365,15 +363,7 @@ async def create_end(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await state.update_data(end_time=value)
     await state.set_state(CreateShiftState.confirm)
-    await message.answer(
-        "Проверь смену:\n\n"
-        f"👤 {data['employee_name']}\n"
-        f"💼 {data['position']}\n"
-        f"📅 {datetime.fromisoformat(data['date']):%d.%m.%Y}\n"
-        f"🕐 {data['start_time']}–{value}\n\n"
-        "Создать эту смену?",
-        reply_markup=confirm_keyboard(),
-    )
+    await message.answer("Проверь смену:\n\n" + f"👤 {data['employee_name']}\n" + f"💼 {data['position']}\n" + f"📅 {datetime.fromisoformat(data['date']):%d.%m.%Y}\n" + f"🕐 {data['start_time']}–{value}\n\nСоздать эту смену?", reply_markup=confirm_keyboard())
 
 
 @router.callback_query(CreateShiftState.confirm, F.data == "create_confirm")
@@ -390,16 +380,7 @@ async def create_confirm(callback: CallbackQuery, state: FSMContext) -> None:
             await state.clear()
             return
         date_value = datetime.fromisoformat(data["date"])
-        shift = await create_shift(
-            session,
-            manager,
-            employee_id=employee.id,
-            venue_id=int(data["venue_id"]),
-            date=date_value,
-            start_time=data["start_time"],
-            end_time=data["end_time"],
-            position=data["position"],
-        )
+        shift = await create_shift(session, manager, employee_id=employee.id, venue_id=int(data["venue_id"]), date=date_value, start_time=data["start_time"], end_time=data["end_time"], position=data["position"])
         label = shift_label(shift)
     await state.clear()
     await notify(callback.bot, employee, f"📅 Менеджер создал для тебя смену.\n{label}")
@@ -417,10 +398,7 @@ async def history(message: Message) -> None:
             return
         result = await session.execute(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(30))
         logs = result.scalars().all()
-    await message.answer(
-        "Последние действия:\n\n" + ("\n".join(f"{x.created_at:%d.%m %H:%M} — {x.action} #{x.entity_id}" for x in logs) if logs else "История пока пустая."),
-        reply_markup=back_keyboard(),
-    )
+    await message.answer("Последние действия:\n\n" + ("\n".join(f"{x.created_at:%d.%m %H:%M} — {x.action} #{x.entity_id}" for x in logs) if logs else "История пока пустая."), reply_markup=back_keyboard())
 
 
 @router.message(F.text == "Уведомления")
@@ -434,7 +412,4 @@ async def profile(message: Message) -> None:
     if not employee:
         await message.answer("Ты не зарегистрирован.")
         return
-    await message.answer(
-        f"Профиль:\n{employee.full_name}\nДолжность: {employee.position}\nРоль: {employee.role.value}",
-        reply_markup=back_keyboard(),
-    )
+    await message.answer(f"Профиль:\n{employee.full_name}\nДолжность: {employee.position}\nРоль: {employee.role.value}", reply_markup=back_keyboard())
