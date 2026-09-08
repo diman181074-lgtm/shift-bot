@@ -44,9 +44,10 @@ class Employee(Base):
     __tablename__ = "employees"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, index=True, nullable=True)
+    telegram_username: Mapped[str | None] = mapped_column(String(64), unique=True, index=True, nullable=True)
     full_name: Mapped[str] = mapped_column(String(160))
-    position: Mapped[str] = mapped_column(String(80))
+    position: Mapped[str] = mapped_column(String(80), default="официант")
     role: Mapped[Role] = mapped_column(default=Role.EMPLOYEE)
     venue_id: Mapped[int | None] = mapped_column(ForeignKey("venues.id"), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True)
