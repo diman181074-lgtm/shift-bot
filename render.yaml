@@ -3,6 +3,7 @@ services:
     name: shift-handover-bot
     runtime: python
     plan: free
+    region: frankfurt
     buildCommand: pip install --no-cache-dir -r requirements.txt
     startCommand: python -m app.main
     healthCheckPath: /health
