@@ -1,14 +1,25 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AuditLog, Employee, RequestStatus, Shift, ShiftStatus, SubstitutionRequest
 
 
-async def employee_by_telegram(session: AsyncSession, telegram_id: int) -> Employee | None:
-    result = await session.execute(select(Employee).where(Employee.telegram_id == telegram_id, Employee.is_active.is_(True)))
-    return result.scalar_one_or_none()
+async def employee_by_telegram(
+    session: AsyncSession, telegram_id: int, username: str | None = None
+) -> Employee | None:
+    conditions = [Employee.telegram_id == telegram_id]
+    if username:
+        conditions.append(Employee.telegram_username == username.lstrip("@"))
+    result = await session.execute(
+        select(Employee).where(or_(*conditions), Employee.is_active.is_(True))
+    )
+    employee = result.scalar_one_or_none()
+    if employee and employee.telegram_id is None:
+        employee.telegram_id = telegram_id
+        await session.commit()
+    return employee
 
 
 async def audit(session: AsyncSession, actor: Employee | None, action: str, entity_type: str, entity_id: int, details: str = "") -> None:
