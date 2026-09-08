@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: shift-handover-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python -m app.main
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: shiftbot-db
+          property: connectionString
+
+databases:
+  - name: shiftbot-db
+    plan: free
+    region: frankfurt
