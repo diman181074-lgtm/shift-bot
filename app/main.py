@@ -1,4 +1,6 @@
 import asyncio
+import os
+from urllib.parse import urlsplit
 
 import uvicorn
 from aiogram import Bot, Dispatcher
@@ -16,8 +18,17 @@ app = FastAPI(title="Shift Handover Bot")
 
 @app.on_event("startup")
 async def startup() -> None:
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    parsed = urlsplit(settings.database_url)
+    print(
+        f"Database preflight: host={parsed.hostname!r}, "
+        f"port={parsed.port!r}, database={parsed.path.lstrip('/')!r}"
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+    except Exception as exc:
+        print(f"Database startup failed: {type(exc).__name__}: {exc}")
+        raise
 
 
 @app.on_event("shutdown")
@@ -43,10 +54,12 @@ async def run_bot() -> None:
 
 
 async def run_web() -> None:
+    # Render provides PORT for web services (default 10000).
+    port = int(os.getenv("PORT", str(settings.port)))
     config = uvicorn.Config(
         app,
-        host=settings.host,
-        port=settings.port,
+        host="0.0.0.0",
+        port=port,
         log_level="info",
     )
     server = uvicorn.Server(config)
