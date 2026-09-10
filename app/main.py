@@ -10,6 +10,7 @@ from app.bot import router
 from app.config import settings
 from app.db import Base, engine
 from app.telegram_link import TelegramLinkMiddleware
+from seed_data import seed
 import app.models  # noqa: F401 - register SQLAlchemy models
 
 
@@ -26,6 +27,7 @@ async def startup() -> None:
     try:
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        await seed()
     except Exception as exc:
         print(f"Database startup failed: {type(exc).__name__}: {exc}")
         raise
