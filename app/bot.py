@@ -87,6 +87,54 @@ async def chat_id_command(message: Message) -> None:
     await message.answer(f"ID этой беседы: <code>{message.chat.id}</code>", parse_mode="HTML")
 
 
+@router.message(Command("register"))
+async def register_command(message: Message) -> None:
+    """Admin-only helper for registering an employee by Telegram username.
+
+    Usage: /register @username [full name]
+    The Telegram ID is linked automatically when that user sends /start.
+    """
+    async with SessionLocal() as session:
+        admin = await employee_by_telegram(session, message.from_user.id)
+        if not admin or admin.role != Role.ADMIN:
+            await message.answer("Доступ только для администратора.")
+            return
+
+        parts = message.text.split(maxsplit=2) if message.text else []
+        if len(parts) < 2:
+            await message.answer("Формат: /register @username Имя Фамилия")
+            return
+
+        username = parts[1].lstrip("@").strip()
+        full_name = parts[2].strip() if len(parts) == 3 else username
+        if not username:
+            await message.answer("Укажи Telegram username после /register.")
+            return
+
+        result = await session.execute(select(Employee).where(Employee.telegram_username == username))
+        employee = result.scalar_one_or_none()
+        if employee:
+            employee.full_name = full_name
+            employee.position = "официант"
+            employee.is_active = True
+        else:
+            employee = Employee(
+                telegram_username=username,
+                full_name=full_name,
+                position="официант",
+                role=Role.EMPLOYEE,
+                is_active=True,
+                notifications_enabled=True,
+            )
+            session.add(employee)
+        await session.commit()
+
+    await message.answer(
+        f"✅ Сотрудник {full_name} (@{username}) зарегистрирован.\n"
+        "Теперь пусть отправит боту /start — Telegram ID привяжется автоматически."
+    )
+
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -259,24 +307,52 @@ async def decision_callback(callback: CallbackQuery) -> None:
         if not manager or manager.role not in (Role.MANAGER, Role.ADMIN) or not request:
             await callback.answer("Нет доступа", show_alert=True)
             return
-        old_employee = await session.get(Employee, request.old_employee_id)
-        new_employee = await session.get(Employee, request.new_employee_id)
         shift = await session.get(Shift, request.shift_id)
-        try:
-            await decide_request(session, manager, request, approve)
-        except ValueError:
+        new_employee = await session.get(Employee, request.new_employee_id)
+        old_employee = await session.get(Employee, request.old_employee_id)
+        if request.status != RequestStatus.PENDING:
             await callback.answer("Заявка уже обработана", show_alert=True)
             return
+        await decide_request(session, manager, request, approve)
         label = shift_label(shift) if shift else f"Смена #{request.shift_id}"
-    if approve:
-        await notify(callback.bot, new_employee, f"✅ Менеджер одобрил заявку #{request_id}.\nТеперь твоя смена:\n{label}")
-        await notify(callback.bot, old_employee, f"✅ Менеджер подтвердил передачу смены #{request.shift_id}.\nНовый сотрудник: {new_employee.full_name if new_employee else '—'}\n{label}")
-    else:
-        await notify(callback.bot, new_employee, f"❌ Менеджер отклонил заявку #{request_id}.\nСмена снова доступна для получения.\n{label}")
-        await notify(callback.bot, old_employee, f"ℹ️ Заявка на получение твоей смены #{request.shift_id} отклонена менеджером.\n{label}")
-    result = "одобрена" if approve else "отклонена"
-    await callback.message.edit_text(f"Заявка #{request_id} {result}.\n\n{label}")
+    status_text = "одобрена" if approve else "отклонена"
+    await notify(callback.bot, new_employee, f"📣 Твоя заявка #{request.id} {status_text}.\n{label}")
+    await notify(callback.bot, old_employee, f"📣 Заявка #{request.id} на передачу смены {status_text}.\n{label}")
+    await callback.message.edit_text(f"Заявка #{request.id}: {status_text}.\n\n{label}")
     await callback.answer()
+
+
+@router.message(F.text == "История")
+async def history(message: Message) -> None:
+    async with SessionLocal() as session:
+        employee = await employee_by_telegram(session, message.from_user.id)
+        if not employee:
+            await message.answer("Ты не зарегистрирован.")
+            return
+        result = await session.execute(select(AuditLog).where(AuditLog.employee_id == employee.id).order_by(AuditLog.created_at.desc()).limit(30))
+        logs = result.scalars().all()
+    await message.answer("История:\n\n" + ("\n".join(f"{log.created_at:%d.%m %H:%M} — {log.action}" for log in logs) if logs else "История пока пуста."), reply_markup=back_keyboard())
+
+
+@router.message(F.text == "Уведомления")
+async def notifications(message: Message) -> None:
+    employee = await get_employee(message)
+    if not employee:
+        await message.answer("Ты не зарегистрирован.")
+        return
+    await message.answer(f"Уведомления: {'включены' if employee.notifications_enabled else 'выключены'}.", reply_markup=back_keyboard())
+
+
+@router.message(F.text == "Профиль")
+async def profile(message: Message) -> None:
+    employee = await get_employee(message)
+    if not employee:
+        await message.answer("Ты не зарегистрирован.")
+        return
+    await message.answer(
+        f"Профиль:\n{employee.full_name}\nДолжность: {employee.position}\nРоль: {employee.role.value}",
+        reply_markup=back_keyboard(),
+    )
 
 
 @router.message(F.text == "Создать смену")
@@ -288,60 +364,39 @@ async def create_shift_start(message: Message, state: FSMContext) -> None:
     async with SessionLocal() as session:
         result = await session.execute(select(Employee).where(Employee.is_active.is_(True)).order_by(Employee.full_name))
         employees = result.scalars().all()
-    if not employees:
-        await message.answer("Нет активных сотрудников. Сначала добавьте сотрудников.")
-        return
-    await state.clear()
     await state.set_state(CreateShiftState.employee)
-    await message.answer("👤 Выбери сотрудника, для которого создаём смену:", reply_markup=employees_keyboard(employees))
+    await message.answer("Выбери сотрудника:", reply_markup=employees_keyboard(employees))
 
 
-@router.callback_query(CreateShiftState.employee, F.data.startswith("create_employee:"))
+@router.callback_query(F.data.startswith("create_employee:"))
 async def create_employee_callback(callback: CallbackQuery, state: FSMContext) -> None:
     employee_id = int(callback.data.split(":")[1])
     async with SessionLocal() as session:
-        manager = await employee_by_telegram(session, callback.from_user.id)
         employee = await session.get(Employee, employee_id)
-        if not manager or manager.role not in (Role.MANAGER, Role.ADMIN) or not employee or not employee.is_active:
-            await callback.answer("Сотрудник не найден", show_alert=True)
-            return
-        if employee.venue_id is None:
-            await callback.answer("У сотрудника не указана точка", show_alert=True)
-            return
-        await state.update_data(employee_id=employee.id, employee_name=employee.full_name, position=employee.position, venue_id=employee.venue_id)
+    if not employee:
+        await callback.answer("Сотрудник не найден", show_alert=True)
+        return
+    await state.update_data(employee_id=employee.id, employee_name=employee.full_name, position=employee.position)
     await state.set_state(CreateShiftState.date)
     await callback.message.edit_text(f"Сотрудник: {employee.full_name}\nДолжность: {employee.position}\n\n📅 Введи дату смены в формате ДД.ММ.ГГГГ")
     await callback.answer()
 
 
-@router.callback_query(F.data == "create_cancel")
-async def create_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    employee = await get_employee(callback.message)
-    await callback.message.edit_text("Создание смены отменено.")
-    if employee:
-        await callback.message.answer("Выбери действие:", reply_markup=main_menu(employee.role))
-    await callback.answer()
-
-
 @router.message(CreateShiftState.date)
-async def create_date(message: Message, state: FSMContext) -> None:
+async def create_shift_date(message: Message, state: FSMContext) -> None:
     try:
-        date_value = datetime.strptime(message.text.strip(), "%d.%m.%Y").replace(tzinfo=timezone.utc)
-    except (ValueError, AttributeError):
+        value = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
         await message.answer("Неверная дата. Пример: 11.09.2026")
         return
-    if date_value.date() < datetime.now(timezone.utc).date():
-        await message.answer("Дата уже прошла. Введи сегодняшнюю или будущую дату.")
-        return
-    await state.update_data(date=date_value.isoformat())
+    await state.update_data(date=value.isoformat())
     await state.set_state(CreateShiftState.start)
     await message.answer("🕐 Введи время начала в формате ЧЧ:ММ\nНапример: 11:00")
 
 
 @router.message(CreateShiftState.start)
-async def create_start(message: Message, state: FSMContext) -> None:
-    value = message.text.strip() if message.text else ""
+async def create_shift_start_time(message: Message, state: FSMContext) -> None:
+    value = message.text.strip()
     try:
         datetime.strptime(value, "%H:%M")
     except ValueError:
@@ -353,8 +408,8 @@ async def create_start(message: Message, state: FSMContext) -> None:
 
 
 @router.message(CreateShiftState.end)
-async def create_end(message: Message, state: FSMContext) -> None:
-    value = message.text.strip() if message.text else ""
+async def create_shift_end_time(message: Message, state: FSMContext) -> None:
+    value = message.text.strip()
     try:
         datetime.strptime(value, "%H:%M")
     except ValueError:
@@ -363,53 +418,38 @@ async def create_end(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await state.update_data(end_time=value)
     await state.set_state(CreateShiftState.confirm)
-    await message.answer("Проверь смену:\n\n" + f"👤 {data['employee_name']}\n" + f"💼 {data['position']}\n" + f"📅 {datetime.fromisoformat(data['date']):%d.%m.%Y}\n" + f"🕐 {data['start_time']}–{value}\n\nСоздать эту смену?", reply_markup=confirm_keyboard())
+    await message.answer(
+        f"Проверь смену:\n\n{data['employee_name']} · {data['position']}\n{datetime.fromisoformat(data['date']):%d.%m.%Y} · {data['start_time']}–{value}\n\nСоздать?",
+        reply_markup=confirm_keyboard(),
+    )
 
 
-@router.callback_query(CreateShiftState.confirm, F.data == "create_confirm")
+@router.callback_query(F.data == "create_confirm")
 async def create_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
+    manager = await get_employee(callback.message)
+    if not manager or manager.role not in (Role.MANAGER, Role.ADMIN):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     async with SessionLocal() as session:
-        manager = await employee_by_telegram(session, callback.from_user.id)
-        if not manager or manager.role not in (Role.MANAGER, Role.ADMIN):
-            await callback.answer("Нет доступа", show_alert=True)
-            return
+        shift = await create_shift(
+            session,
+            manager,
+            employee_id=int(data["employee_id"]),
+            date=datetime.fromisoformat(data["date"]).date(),
+            start_time=data["start_time"],
+            end_time=data["end_time"],
+        )
         employee = await session.get(Employee, int(data["employee_id"]))
-        if not employee or not employee.is_active:
-            await callback.answer("Сотрудник больше недоступен", show_alert=True)
-            await state.clear()
-            return
-        date_value = datetime.fromisoformat(data["date"])
-        shift = await create_shift(session, manager, employee_id=employee.id, venue_id=int(data["venue_id"]), date=date_value, start_time=data["start_time"], end_time=data["end_time"], position=data["position"])
         label = shift_label(shift)
-    await state.clear()
     await notify(callback.bot, employee, f"📅 Менеджер создал для тебя смену.\n{label}")
     await callback.message.edit_text(f"✅ Смена #{shift.id} создана.\n\n{label}")
-    await callback.message.answer("Выбери действие:", reply_markup=main_menu(manager.role))
+    await state.clear()
     await callback.answer()
 
 
-@router.message(F.text == "История")
-async def history(message: Message) -> None:
-    async with SessionLocal() as session:
-        employee = await employee_by_telegram(session, message.from_user.id)
-        if not employee:
-            await message.answer("Ты не зарегистрирован.")
-            return
-        result = await session.execute(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(30))
-        logs = result.scalars().all()
-    await message.answer("Последние действия:\n\n" + ("\n".join(f"{x.created_at:%d.%m %H:%M} — {x.action} #{x.entity_id}" for x in logs) if logs else "История пока пустая."), reply_markup=back_keyboard())
-
-
-@router.message(F.text == "Уведомления")
-async def notifications(message: Message) -> None:
-    await message.answer("🔔 Уведомления включены.")
-
-
-@router.message(F.text == "Профиль")
-async def profile(message: Message) -> None:
-    employee = await get_employee(message)
-    if not employee:
-        await message.answer("Ты не зарегистрирован.")
-        return
-    await message.answer(f"Профиль:\n{employee.full_name}\nДолжность: {employee.position}\nРоль: {employee.role.value}", reply_markup=back_keyboard())
+@router.callback_query(F.data == "create_cancel")
+async def create_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text("Создание смены отменено.")
+    await callback.answer()
