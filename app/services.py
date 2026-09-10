@@ -25,7 +25,7 @@ async def audit(session: AsyncSession, actor: Employee | None, action: str, enti
 
 
 async def give_shift(session: AsyncSession, employee: Employee, shift: Shift) -> None:
-    if shift.employee_id != employee.id or shift.status != ShiftStatus.SCHEDULED:
+    if shift.employee_id != employee.id or shift.status not in (ShiftStatus.SCHEDULED, ShiftStatus.APPROVED):
         raise ValueError("shift_unavailable")
     shift.status = ShiftStatus.OFFERED
     await audit(session, employee, "SHIFT_OFFERED", "shift", shift.id)
