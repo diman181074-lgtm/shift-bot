@@ -9,5 +9,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY seed_data.py ./seed_data.py
 
 CMD ["python", "-m", "app.main"]
